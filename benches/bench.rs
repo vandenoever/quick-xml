@@ -51,7 +51,7 @@ fn bench_quick_xml_escaped(b: &mut Bencher) {
             }
         }
         assert_eq!(count, 1550);
-        assert_eq!(nbtxt, 66277);
+        assert_eq!(nbtxt, 66276);
     });
 }
 

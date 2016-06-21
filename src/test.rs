@@ -233,9 +233,9 @@ fn test_buf_position() {
         .with_check(true);
 
     match r.next() {
-        Some(Err((_, 2))) => assert!(true), // error at char 2: no opening tag
+        Some(Err((_, 1))) => assert!(true), // error at char 2: no opening tag
         Some(Err((e, n))) => assert!(false, 
-                                     "expecting buf_pos = 2, found {}, err: {:?}", n, e),
+                                     "expecting buf_pos = 1, found {}, err: {:?}", n, e),
         e => assert!(false, "expecting error, found {:?}", e),
     }
 
@@ -246,9 +246,9 @@ fn test_buf_position() {
     next_eq!(r, Start, b"a");
 
     match r.next() {
-        Some(Err((_, 5))) => assert!(true), // error at char 5: no closing --> tag found
+        Some(Err((_, 4))) => assert!(true), // error at char 5: no closing --> tag found
         Some(Err((e, n))) => assert!(false, 
-                                     "expecting buf_pos = 2, found {}, err: {:?}", n, e),
+                                     "expecting buf_pos = 4, found {}, err: {:?}", n, e),
         e => assert!(false, "expecting error, found {:?}", e),
     }
 

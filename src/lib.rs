@@ -25,7 +25,7 @@ mod escape;
 mod test;
 
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::iter::IntoIterator;
 use std::ops::Range;
 use std::path::Path;
@@ -230,25 +230,24 @@ impl<B: BufRead> XmlReader<B> {
     fn read_until_open(&mut self) -> Option<ResultPos<Event>> {
         self.tag_state = TagState::Opened;
         let mut buf = Vec::new();
-        match read_until(&mut self.reader, b'<', &mut buf) {
+        match self.reader.read_until(b'<', &mut buf) {
             Ok(0) => None,
             Ok(n) => {
                 self.buf_position += n;
                 let (start, len) = if self.trim_text {
+                    let buf = &buf[..n - 1]; // exclude trailing '<'
                     match buf.iter().position(|&b| !is_whitespace(b)) {
-                        Some(start) => {
-                            (start, buf.len() - buf.iter().rev()
-                                                   .position(|&b| !is_whitespace(b))
-                                                   .unwrap_or(0))
-                        }
+                        Some(start) => (start, n - 1 - buf.iter().rev()
+                                                          .position(|&b| !is_whitespace(b))
+                                                          .unwrap_or(0)),
                         None => return self.next(),
                     }
                 } else {
-                    (0, buf.len())
+                    (0, n - 1)
                 };
                 Some(Ok(Event::Text(Element::from_buffer(buf, start, len, len))))
             }
-            Err(e) => Some(self.error(e, 0)),
+            Err(e) => Some(self.error(Error::Io(e), 0)),
         }
     }
 
@@ -256,7 +255,7 @@ impl<B: BufRead> XmlReader<B> {
     fn read_until_close(&mut self) -> Option<ResultPos<Event>> {
         self.tag_state = TagState::Closed;
         let mut buf = Vec::new();
-        match read_until(&mut self.reader, b'>', &mut buf) {
+        match self.reader.read_until(b'>', &mut buf) {
             Ok(0) => None,
             Ok(n) => {
                 self.buf_position += n;
@@ -267,7 +266,7 @@ impl<B: BufRead> XmlReader<B> {
                     _ => Some(self.read_start(buf)),
                 }
             }
-            Err(e) => Some(self.error(e, 0)),
+            Err(e) => Some(self.error(Error::Io(e), 0)),
         }
     }
 
@@ -275,16 +274,17 @@ impl<B: BufRead> XmlReader<B> {
     /// if `self.with_check`, checks that element matches last opened element
     /// return `End` event
     fn read_end(&mut self, buf: Vec<u8>) -> ResultPos<Event> {
-        let len = buf.len();
+        let len = buf.len() - 1; // remove trailing '>'
         if self.with_check {
             let e = match self.opened.pop() {
                 Some(e) => e,
-                None => return self.error(
-                    Error::Malformed(format!("Cannot close {:?} element, \
-                                             there is no opened element",
-                                             buf[1..].as_str())), len),
+                None => {
+                    let m = format!("Cannot close {:?} element, there is no opened element",
+                                    buf[1..len].as_str());
+                    return self.error(Error::Malformed(m), len);
+                },
             };
-            if &buf[1..] != e.name() {
+            if &buf[1..len] != e.name() {
                 let m = format!("End event {:?} doesn't match last \
                                 opened element {:?}, opened: {:?}",
                                 Element::from_buffer(buf, 1, len, len), e, &self.opened);
@@ -297,21 +297,23 @@ impl<B: BufRead> XmlReader<B> {
     /// reads `Element` starting with a `!`,
     /// return `Comment`, `CData` or `DocType` event
     fn read_bang(&mut self, mut buf: Vec<u8>) -> ResultPos<Event> {
-        let len = buf.len();
+        let mut len = buf.len() - 1;
         if len >= 3 && &buf[1..3] == b"--" {
-            let mut len = buf.len();
-            while len < 5 || &buf[(len - 2)..] != b"--" {
-                buf.push(b'>');
-                match read_until(&mut self.reader, b'>', &mut buf) {
+            let mut bad_end = len < 5 || &buf[len - 2..len] != b"--";
+            while bad_end {
+                match self.reader.read_until(b'>', &mut buf) {
                     Ok(0) => return self.error(
                         Error::Malformed("Unescaped Comment event".to_string()), len),
-                    Ok(n) => self.buf_position += n,
-                    Err(e) => return self.error(e, 0),
+                    Ok(n) => {
+                        self.buf_position += n;
+                        len += n;
+                        bad_end = &buf[len - 2..len] != b"--";
+                    },
+                    Err(e) => return self.error(Error::Io(e), 0),
                 }
-                len = buf.len();
             }
             if self.check_comments {
-                let mut offset = len - 3;
+                let mut offset = len - 2;
                 for w in buf[3..(len - 1)].windows(2) {
                     if &*w == b"--" {
                         return self.error(
@@ -324,35 +326,36 @@ impl<B: BufRead> XmlReader<B> {
         } else if len >= 8 {
             match &buf[1..8] {
                 b"[CDATA[" => {
-                    let mut len = buf.len();
-                    while len < 10 || &buf[(len - 2)..] != b"]]" {
-                        buf.push(b'>');
-                        match read_until(&mut self.reader, b'>', &mut buf) {
+                    let mut bad_end = len < 10 || &buf[len - 2..len] != b"]]";
+                    while bad_end {
+                        match self.reader.read_until(b'>', &mut buf) {
                             Ok(0) => return self.error(
                                 Error::Malformed("Unescaped CDATA event".to_string()), len),
-                            Ok(n) => self.buf_position += n,
-                            Err(e) => return self.error(e, 0),
+                            Ok(n) => {
+                                self.buf_position += n;
+                                len += n;
+                                bad_end = &buf[len - 2..len] != b"]]";
+                            },
+                            Err(e) => return self.error(Error::Io(e), 0),
                         }
-                        len = buf.len();
                     }
                     Ok(Event::CData(Element::from_buffer(buf, 8, len - 2, len - 2)))
                 }
                 b"DOCTYPE" => {
                     let mut count = buf.iter().filter(|&&b| b == b'<').count();
                     while count > 0 {
-                        buf.push(b'>');
-                        match read_until(&mut self.reader, b'>', &mut buf) {
+                        let mut start = 0;
+                        match self.reader.read_until(b'>', &mut buf) {
                             Ok(0) => return self.error(
                                 Error::Malformed("Unescaped DOCTYPE node".to_string()), buf.len()),
                             Ok(n) => {
                                 self.buf_position += n;
-                                let start = buf.len() - n;
-                                count += buf[start..].iter().filter(|&&b| b == b'<').count() - 1;
+                                start += n;
+                                count += buf[start..len].iter().filter(|&&b| b == b'<').count() - 1;
                             }
-                            Err(e) => return self.error(e, 0),
+                            Err(e) => return self.error(Error::Io(e), 0),
                         }
                     }
-                    let len = buf.len();
                     Ok(Event::DocType(Element::from_buffer(buf, 1, len, 8)))
                 }
                 _ => self.error(Error::Malformed("Only Comment, CDATA and DOCTYPE nodes \
@@ -367,12 +370,12 @@ impl<B: BufRead> XmlReader<B> {
     /// reads `Element` starting with a `?`,
     /// return `Decl` or `PI` event
     fn read_question_mark(&mut self, buf: Vec<u8>) -> ResultPos<Event> {
-        let len = buf.len();
-        if len > 2 && buf[len - 1] == b'?' {
-            if len > 5 && &buf[1..4] == b"xml" && is_whitespace(buf[4]) {
-                Ok(Event::Decl(XmlDecl { element: Element::from_buffer(buf, 1, len - 1, 3) }))
+        let len = buf.len() - 2;
+        if len > 0 && buf[len] == b'?' {
+            if len > 4 && &buf[1..4] == b"xml" && is_whitespace(buf[4]) {
+                Ok(Event::Decl(XmlDecl { element: Element::from_buffer(buf, 1, len, 3) }))
             } else {
-                Ok(Event::PI(Element::from_buffer(buf, 1, len - 1, 3)))
+                Ok(Event::PI(Element::from_buffer(buf, 1, len, 3)))
             }
         } else {
             self.error(Error::Malformed("Unescaped XmlDecl event".to_string()), len)
@@ -383,12 +386,16 @@ impl<B: BufRead> XmlReader<B> {
     /// return `Start` event
     fn read_start(&mut self, buf: Vec<u8>) -> ResultPos<Event> {
         // TODO: do this directly when reading bufreader ...
-        let len = buf.len();
-        let name_end = buf.iter().position(|&b| is_whitespace(b)).unwrap_or(len);
+        let len = buf.len() - 1;
+        let mut name_end = buf.iter().position(|&b| is_whitespace(b)).unwrap_or(len);
         if buf[len - 1] == b'/' {
             self.next_close = true;
-            let end = if name_end < len { name_end } else { len - 1 };
-            let element = Element::from_buffer(buf, 0, len - 1, end);
+            if name_end == len {
+                name_end = len - 1;
+            }
+            let element = Element::from_buffer(buf, 0, len - 1, name_end);
+            // always push element, even if not checked as it will correspond to
+            // next `Event::End` element
             self.opened.push(element.clone());
             Ok(Event::Start(element))
         } else {
@@ -402,7 +409,7 @@ impl<B: BufRead> XmlReader<B> {
     /// sets `self.exit = true` so next call will terminate the iterator
     fn error(&mut self, e: Error, offset: usize) -> ResultPos<Event> {
         self.exit = true;
-        Err((e, self.buf_position - offset))
+        Err((e, self.buf_position - offset - 1))
     }
 }
 
@@ -424,8 +431,9 @@ impl<B: BufRead> Iterator for XmlReader<B> {
         }
         if self.next_close {
             self.next_close = false;
-            let e = self.opened.pop().unwrap();
-            return Some(Ok(Event::End(e)));
+            // can safely return last element, always pushed into opened when element ends
+            // with `/`
+            return Some(Ok(Event::End(self.opened.pop().unwrap())));
         }
         match self.tag_state {
             TagState::Opened => self.read_until_close(),
@@ -433,6 +441,7 @@ impl<B: BufRead> Iterator for XmlReader<B> {
         }
     }
 }
+
 /// General content of an event (aka node)
 ///
 /// Element is a wrapper over the bytes representing the node:
@@ -673,52 +682,6 @@ fn is_whitespace(b: u8) -> bool {
         b' ' | b'\r' | b'\n' | b'\t' => true,
         _ => false,
     }
-}
-
-/// `read_until` slighly modified from rust std library
-///
-/// only change is that we do not write the matching character
-#[inline]
-fn read_until<R: BufRead>(r: &mut R, byte: u8, buf: &mut Vec<u8>)
-    -> Result<usize>
-{
-    let mut read = 0;
-    let mut done = false;
-    while !done {
-        let used = {
-            let available = match r.fill_buf() {
-                Ok(n) if n.is_empty() => return Ok(read),
-                Ok(n) => n,
-                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(Error::Io(e)),
-            };
-
-            let mut bytes = available.iter().enumerate();
-
-            let used: usize;
-            loop {
-                match bytes.next() {
-                    Some((i, &b)) => {
-                        if b == byte {
-                            buf.extend_from_slice(&available[..i]);
-                            done = true;
-                            used = i + 1;
-                            break;
-                        }
-                    }
-                    None => {
-                        buf.extend_from_slice(available);
-                        used = available.len();
-                        break;
-                    }
-                }
-            }
-            used
-        };
-        r.consume(used);
-        read += used;
-    }
-    Ok(read)
 }
 
 /// Xml writer
