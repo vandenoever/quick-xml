@@ -24,7 +24,7 @@ extern crate quick_xml;
 ### Reader
 
 ```rust
-use quick_xml::reader::Reader
+use quick_xml::reader::Reader;
 use quick_xml::events::Event;
 
 let xml = r#"<tag1 att1 = "test">
